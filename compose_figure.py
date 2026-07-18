@@ -11,7 +11,7 @@ Config syntax (see example_layout.txt for a full example):
     #                              [font_size=48], [scale=1.0], [width=PX], [height=PX]
     img1 = panel_a.png, label=A
 
-    # PDF panels are automatically converted to PNG via ImageMagick convert.
+    # PDF panels are automatically converted to PNG via pdftoppm / pymupdf.
     img2 = panel_b.pdf, label=B
 
     # Side-by-side. weights=1:1.5 controls relative widths after height-matching.
@@ -35,6 +35,7 @@ Config syntax (see example_layout.txt for a full example):
 
 import sys
 import re
+import shutil
 import argparse
 import subprocess
 import tempfile
@@ -108,11 +109,13 @@ PANEL DEFINITIONS
     trim_left      Pixels to trim from the left edge (default: 0)
     trim_right     Pixels to trim from the right edge (default: 0)
 
-  PDF support: If the file path ends with .pdf, the first page is converted
-  to PNG at 300 dpi using ImageMagick's convert command.
+  PDF support: .pdf files are rasterized at 300 dpi. Converters are tried
+  in order: pdftoppm (poppler-utils) → pymupdf (fitz) → ImageMagick convert.
+  Install the recommended one with:  sudo apt install poppler-utils
 
   Example:
     img1 = panel_a.png, label=A, font_size=48, label_bg=white
+    img2 = figure.pdf,  label=B, scale=0.5
 
 COMPOSITION FUNCTIONS
 ----------------------
@@ -274,16 +277,58 @@ def apply_label(img, kwargs):
 
 
 def _pdf_to_png(pdf_path, dpi=300):
-    """Convert first page of a PDF to a PIL Image using ImageMagick convert."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        tmp_path = tmp.name
-    subprocess.run(
-        ["convert", "-density", str(dpi), str(pdf_path) + "[0]", tmp_path],
-        check=True,
+    """Convert the first page of a PDF to a PIL Image.
+
+    Tries converters in order:
+      1. pdftoppm  (poppler-utils) — not affected by ImageMagick security policy
+      2. pymupdf   (fitz)          — pure Python, no external binary needed
+      3. ImageMagick convert       — last resort; blocked by default on Ubuntu/Debian
+
+    Install the recommended converter:  sudo apt install poppler-utils
+    """
+    # 1. pdftoppm (poppler-utils) --------------------------------------------
+    if shutil.which("pdftoppm"):
+        with tempfile.TemporaryDirectory() as td:
+            prefix = Path(td) / "page"
+            subprocess.run(
+                ["pdftoppm", "-r", str(dpi), "-f", "1", "-l", "1",
+                 "-png", str(pdf_path), str(prefix)],
+                check=True, capture_output=True,
+            )
+            candidates = sorted(Path(td).glob("page*.png"))
+            if not candidates:
+                raise RuntimeError(f"pdftoppm produced no output for {pdf_path}")
+            return Image.open(candidates[0]).copy()  # .copy() outlives the tempdir
+
+    # 2. pymupdf (fitz) -------------------------------------------------------
+    try:
+        import fitz
+        doc = fitz.open(str(pdf_path))
+        page = doc[0]
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    except ImportError:
+        pass
+
+    # 3. ImageMagick convert (may be blocked by /etc/ImageMagick-6/policy.xml) -
+    if shutil.which("convert"):
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            subprocess.run(
+                ["convert", "-density", str(dpi), str(pdf_path) + "[0]", tmp_path],
+                check=True, capture_output=True,
+            )
+            return Image.open(tmp_path).copy()
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+    raise RuntimeError(
+        f"Cannot convert PDF '{pdf_path}': no suitable converter found.\n"
+        "Install poppler-utils (recommended):  sudo apt install poppler-utils\n"
+        "  or pymupdf:                          pip install pymupdf"
     )
-    img = Image.open(tmp_path).convert("RGBA")
-    Path(tmp_path).unlink()
-    return img
 
 
 def load_panel(path, kwargs, base_dir):
@@ -291,7 +336,7 @@ def load_panel(path, kwargs, base_dir):
     if not p.is_absolute():
         p = base_dir / p
     if p.suffix.lower() == ".pdf":
-        img = _pdf_to_png(p)
+        img = _pdf_to_png(p).convert("RGBA")
     else:
         img = Image.open(p).convert("RGBA")
 
@@ -318,7 +363,6 @@ def load_panel(path, kwargs, base_dir):
         w = int(img.width * h / img.height)
         img = img.resize((w, h), Image.LANCZOS)
 
-    img = apply_label(img, kwargs)
     return img
 
 
@@ -331,7 +375,10 @@ def parse_weights(s, n):
     return parts
 
 
-def do_hstack(imgs, kwargs):
+def do_hstack(pairs, kwargs):
+    """pairs is a list of (image, per_panel_kwargs) tuples."""
+    imgs = [p[0] for p in pairs]
+    per_kw = [p[1] for p in pairs]
     n = len(imgs)
     gap = int(kwargs.get("gap", 0))
     align = kwargs.get("align", "center")
@@ -340,10 +387,11 @@ def do_hstack(imgs, kwargs):
     target_h = int(kwargs["height"]) if "height" in kwargs else max(im.height for im in imgs)
 
     resized = []
-    for im, w in zip(imgs, weights):
+    for im, w, pkw in zip(imgs, weights, per_kw):
         scale = target_h / im.height
         new_w = int(im.width * scale * w)
-        resized.append(im.resize((new_w, target_h), Image.LANCZOS))
+        im = im.resize((new_w, target_h), Image.LANCZOS)
+        resized.append(apply_label(im, pkw))
 
     total_w = sum(im.width for im in resized) + gap * (n - 1)
     canvas = Image.new("RGBA", (total_w, target_h), (0, 0, 0, 0))
@@ -356,7 +404,10 @@ def do_hstack(imgs, kwargs):
     return canvas
 
 
-def do_vstack(imgs, kwargs):
+def do_vstack(pairs, kwargs):
+    """pairs is a list of (image, per_panel_kwargs) tuples."""
+    imgs = [p[0] for p in pairs]
+    per_kw = [p[1] for p in pairs]
     n = len(imgs)
     gap = int(kwargs.get("gap", 0))
     align = kwargs.get("align", "center")
@@ -365,10 +416,11 @@ def do_vstack(imgs, kwargs):
     target_w = int(kwargs["width"]) if "width" in kwargs else max(im.width for im in imgs)
 
     resized = []
-    for im, w in zip(imgs, weights):
+    for im, w, pkw in zip(imgs, weights, per_kw):
         scale = target_w / im.width
         new_h = int(im.height * scale * w)
-        resized.append(im.resize((target_w, new_h), Image.LANCZOS))
+        im = im.resize((target_w, new_h), Image.LANCZOS)
+        resized.append(apply_label(im, pkw))
 
     total_h = sum(im.height for im in resized) + gap * (n - 1)
     canvas = Image.new("RGBA", (target_w, total_h), (0, 0, 0, 0))
@@ -408,20 +460,25 @@ def do_overlay(base, inset, kwargs):
 
 
 def build(nodes, order, base_dir):
+    # resolved maps name -> (img, kwargs) so labels can be applied after resizing
     resolved = {}
     for name in order:
         kind, a, kwargs = nodes[name]
         if kind == "panel":
-            resolved[name] = load_panel(a, kwargs, base_dir)
+            img = load_panel(a, kwargs, base_dir)
+            resolved[name] = (img, kwargs)
         elif kind == "hstack":
-            imgs = [resolved[r] for r in a]
-            resolved[name] = apply_label(do_hstack(imgs, kwargs), kwargs)
+            pairs = [resolved[r] for r in a]
+            img = apply_label(do_hstack(pairs, kwargs), kwargs)
+            resolved[name] = (img, {})
         elif kind == "vstack":
-            imgs = [resolved[r] for r in a]
-            resolved[name] = apply_label(do_vstack(imgs, kwargs), kwargs)
+            pairs = [resolved[r] for r in a]
+            img = apply_label(do_vstack(pairs, kwargs), kwargs)
+            resolved[name] = (img, {})
         elif kind == "overlay":
-            base_img, inset_img = resolved[a[0]], resolved[a[1]]
-            resolved[name] = do_overlay(base_img, inset_img, kwargs)
+            base_img = resolved[a[0]][0]
+            inset_img = resolved[a[1]][0]
+            resolved[name] = (do_overlay(base_img, inset_img, kwargs), {})
         else:
             raise ValueError(f"Unknown layout function: {kind}")
     return resolved
@@ -457,7 +514,7 @@ def main():
     if not canvas_name or canvas_name not in resolved:
         raise ValueError("Config must set 'canvas = <node_name>' pointing to a defined node")
 
-    final = resolved[canvas_name]
+    final = resolved[canvas_name][0]
     background = settings.get("background", "white")
     flat = Image.new("RGB", final.size, background)
     flat.paste(final, (0, 0), final)
