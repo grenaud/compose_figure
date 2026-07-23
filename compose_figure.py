@@ -104,6 +104,16 @@ PANEL DEFINITIONS
     scale          Resize multiplier applied to the loaded image
     width, height  Explicit pixel dimensions (overrides scale; if only one
                    of width/height is given, aspect ratio is preserved)
+    fit            stretch | contain (default: stretch). Only relevant when
+                   BOTH width and height are given. 'stretch' resizes the
+                   image to exactly width x height, distorting its aspect
+                   ratio if needed (previous/default behavior). 'contain'
+                   scales the image to fit inside width x height while
+                   preserving its aspect ratio, then pads the leftover
+                   space with pad_color and centers the image in the box.
+    pad_color      Fill color for the letterbox/pillarbox padding created
+                   by fit=contain (default: the top-level 'background'
+                   setting, or white if that isn't set)
     trim_top       Pixels to trim from the top edge (default: 0)
     trim_bottom    Pixels to trim from the bottom edge (default: 0)
     trim_left      Pixels to trim from the left edge (default: 0)
@@ -116,20 +126,32 @@ PANEL DEFINITIONS
   Example:
     img1 = panel_a.png, label=A, font_size=48, label_bg=white
     img2 = figure.pdf,  label=B, scale=0.5
+    img3 = panel_c.png, width=800, height=600, fit=contain, pad_color=white
 
 COMPOSITION FUNCTIONS
 ----------------------
-  hstack(a, b, ..., weights=W1:W2:..., gap=PX, align=top|center|bottom)
+  hstack(a, b, ..., weights=W1:W2:..., gap=PX, align=top|center|bottom,
+         fit=stretch|contain, pad_color=COLOR)
     Places panels side by side. All inputs are first resized to a common
     height (the tallest input, or an explicit height=PX). 'weights' then
-    scales each panel's width relative to the others post height-matching
-    — weights=1:1.5 makes the second panel 1.5x as wide as the first.
-    'align' controls vertical alignment if any panel was already a
-    different aspect ratio. 'gap' is the pixel spacing between panels.
+    determines each panel's allotted width (its "slot") relative to the
+    others — weights=1:1.5 gives the second panel 1.5x the width of the
+    first. By default (fit=stretch) the panel image is stretched to
+    exactly fill its slot, which distorts its aspect ratio whenever the
+    weight isn't 1. With fit=contain, the panel image instead keeps its
+    own aspect ratio, is scaled down to fit inside its slot, and is
+    centered there (both horizontally and vertically) — the leftover
+    space in the slot is padded with 'pad_color' (default: the top-level
+    'background' setting, or white). 'gap' is the pixel spacing between
+    panels.
 
-  vstack(a, b, ..., weights=W1:W2:..., gap=PX, align=left|center|right)
+  vstack(a, b, ..., weights=W1:W2:..., gap=PX, align=left|center|right,
+         fit=stretch|contain, pad_color=COLOR)
     The vertical mirror of hstack: panels are stacked top to bottom, first
-    matched to a common width, then scaled in height by 'weights'.
+    matched to a common width, then each given a height "slot" scaled by
+    'weights'. fit=contain preserves each panel's own aspect ratio inside
+    its slot instead of stretching it, centering it (both directions) and
+    padding the leftover space with 'pad_color'.
 
   overlay(base, inset, scale=FRACTION, pos=POSITION, margin=PX)
     Pastes 'inset' on top of 'base'. 'scale' sets the inset's width as a
@@ -331,7 +353,22 @@ def _pdf_to_png(pdf_path, dpi=300):
     )
 
 
-def load_panel(path, kwargs, base_dir):
+def fit_and_pad(img, target_w, target_h, pad_color):
+    """Scale img to fit inside target_w x target_h preserving aspect ratio,
+    then center it on a target_w x target_h canvas filled with pad_color."""
+    scale = min(target_w / img.width, target_h / img.height)
+    new_w = max(1, round(img.width * scale))
+    new_h = max(1, round(img.height * scale))
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+
+    canvas = Image.new("RGBA", (target_w, target_h), pad_color)
+    x = (target_w - new_w) // 2
+    y = (target_h - new_h) // 2
+    canvas.paste(resized, (x, y), resized)
+    return canvas
+
+
+def load_panel(path, kwargs, base_dir, default_pad_color="white"):
     p = Path(path)
     if not p.is_absolute():
         p = base_dir / p
@@ -353,7 +390,12 @@ def load_panel(path, kwargs, base_dir):
         s = float(kwargs["scale"])
         img = img.resize((max(1, int(img.width * s)), max(1, int(img.height * s))), Image.LANCZOS)
     if "width" in kwargs and "height" in kwargs:
-        img = img.resize((int(kwargs["width"]), int(kwargs["height"])), Image.LANCZOS)
+        target_w, target_h = int(kwargs["width"]), int(kwargs["height"])
+        if kwargs.get("fit", "stretch") == "contain":
+            pad_color = kwargs.get("pad_color", default_pad_color)
+            img = fit_and_pad(img, target_w, target_h, pad_color)
+        else:
+            img = img.resize((target_w, target_h), Image.LANCZOS)
     elif "width" in kwargs:
         w = int(kwargs["width"])
         h = int(img.height * w / img.width)
@@ -375,7 +417,7 @@ def parse_weights(s, n):
     return parts
 
 
-def do_hstack(pairs, kwargs):
+def do_hstack(pairs, kwargs, default_pad_color="white"):
     """pairs is a list of (image, per_panel_kwargs) tuples."""
     imgs = [p[0] for p in pairs]
     per_kw = [p[1] for p in pairs]
@@ -383,14 +425,19 @@ def do_hstack(pairs, kwargs):
     gap = int(kwargs.get("gap", 0))
     align = kwargs.get("align", "center")
     weights = parse_weights(kwargs.get("weights"), n)
+    fit = kwargs.get("fit", "stretch")
+    pad_color = kwargs.get("pad_color", default_pad_color)
 
     target_h = int(kwargs["height"]) if "height" in kwargs else max(im.height for im in imgs)
 
     resized = []
     for im, w, pkw in zip(imgs, weights, per_kw):
         scale = target_h / im.height
-        new_w = int(im.width * scale * w)
-        im = im.resize((new_w, target_h), Image.LANCZOS)
+        slot_w = max(1, round(im.width * scale * w))
+        if fit == "contain":
+            im = fit_and_pad(im, slot_w, target_h, pad_color)
+        else:
+            im = im.resize((slot_w, target_h), Image.LANCZOS)
         resized.append(apply_label(im, pkw))
 
     total_w = sum(im.width for im in resized) + gap * (n - 1)
@@ -404,7 +451,7 @@ def do_hstack(pairs, kwargs):
     return canvas
 
 
-def do_vstack(pairs, kwargs):
+def do_vstack(pairs, kwargs, default_pad_color="white"):
     """pairs is a list of (image, per_panel_kwargs) tuples."""
     imgs = [p[0] for p in pairs]
     per_kw = [p[1] for p in pairs]
@@ -412,14 +459,19 @@ def do_vstack(pairs, kwargs):
     gap = int(kwargs.get("gap", 0))
     align = kwargs.get("align", "center")
     weights = parse_weights(kwargs.get("weights"), n)
+    fit = kwargs.get("fit", "stretch")
+    pad_color = kwargs.get("pad_color", default_pad_color)
 
     target_w = int(kwargs["width"]) if "width" in kwargs else max(im.width for im in imgs)
 
     resized = []
     for im, w, pkw in zip(imgs, weights, per_kw):
         scale = target_w / im.width
-        new_h = int(im.height * scale * w)
-        im = im.resize((target_w, new_h), Image.LANCZOS)
+        slot_h = max(1, round(im.height * scale * w))
+        if fit == "contain":
+            im = fit_and_pad(im, target_w, slot_h, pad_color)
+        else:
+            im = im.resize((target_w, slot_h), Image.LANCZOS)
         resized.append(apply_label(im, pkw))
 
     total_h = sum(im.height for im in resized) + gap * (n - 1)
@@ -459,21 +511,21 @@ def do_overlay(base, inset, kwargs):
     return apply_label(base, kwargs)
 
 
-def build(nodes, order, base_dir):
+def build(nodes, order, base_dir, default_pad_color="white"):
     # resolved maps name -> (img, kwargs) so labels can be applied after resizing
     resolved = {}
     for name in order:
         kind, a, kwargs = nodes[name]
         if kind == "panel":
-            img = load_panel(a, kwargs, base_dir)
+            img = load_panel(a, kwargs, base_dir, default_pad_color)
             resolved[name] = (img, kwargs)
         elif kind == "hstack":
             pairs = [resolved[r] for r in a]
-            img = apply_label(do_hstack(pairs, kwargs), kwargs)
+            img = apply_label(do_hstack(pairs, kwargs, default_pad_color), kwargs)
             resolved[name] = (img, {})
         elif kind == "vstack":
             pairs = [resolved[r] for r in a]
-            img = apply_label(do_vstack(pairs, kwargs), kwargs)
+            img = apply_label(do_vstack(pairs, kwargs, default_pad_color), kwargs)
             resolved[name] = (img, {})
         elif kind == "overlay":
             base_img = resolved[a[0]][0]
@@ -508,14 +560,14 @@ def main():
     base_dir = config_path.parent
 
     nodes, settings, order = parse_config(config_path)
-    resolved = build(nodes, order, base_dir)
+    background = settings.get("background", "white")
+    resolved = build(nodes, order, base_dir, default_pad_color=background)
 
     canvas_name = settings.get("canvas")
     if not canvas_name or canvas_name not in resolved:
         raise ValueError("Config must set 'canvas = <node_name>' pointing to a defined node")
 
     final = resolved[canvas_name][0]
-    background = settings.get("background", "white")
     flat = Image.new("RGB", final.size, background)
     flat.paste(final, (0, 0), final)
 
